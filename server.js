@@ -1,187 +1,454 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import Groq from "groq-sdk";
-import appointmentRoutes from "./routes/appointmentRoutes.ts";
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import tesseract from 'node-tesseract-ocr';
+import fetch from 'node-fetch';
 
 dotenv.config();
 
 const app = express();
-
-app.use(cors());
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
-
 const PORT = process.env.PORT || 5000;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// Initialize Groq
-let groqClient = null;
-
-if (GROQ_API_KEY) {
-  groqClient = new Groq({
-    apiKey: GROQ_API_KEY
-  });
+if (!GEMINI_API_KEY) {
+  console.warn('⚠️ WARNING: GEMINI_API_KEY is not set in .env file');
 }
 
-// Store conversation history
-const conversationHistories = new Map();
+// Middleware
+// CORS configuration - allow only the frontend origin by default.
+// For quick hackathon testing you can still set ORIGIN to '*' but it's safer
+// to restrict to your dev server (e.g. http://localhost:5173).
+const corsOptions = {
+  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'],
+  credentials: true
+};
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// HEALTH CHECK
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    groqConfigured: !!GROQ_API_KEY,
-    model: "Groq Llama 3.1 8B Instant"
-  });
-});
 
-// ADVANCED CHATBOT with Groq API
-app.post("/api/chat", async (req, res) => {
+// OCR Configuration
+const ocrConfig = {
+  lang: 'eng',
+  oem: 1,
+  psm: 3
+};
+
+// Medical Analysis Function
+async function analyzeMedicalReport(extractedText) {
   try {
-    const { message, sessionId = "default" } = req.body;
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: `You are a medical assistant. Analyze this medical report and provide:
 
-    if (!message || message.trim() === "") {
-      return res.status(400).json({ error: "Message is required" });
+1. **Summary**: Brief overview of the report (2-3 sentences)
+2. **Key Findings**: Important medical observations, test results, diagnoses
+3. **Values & Measurements**: Extract all numerical values with their units and reference ranges
+4. **Patient Information**: Name, age, date, hospital/clinic (if present)
+5. **Recommendations**: Any prescribed medications, follow-up instructions, or warnings
+6. **Abnormalities**: Flag any values outside normal ranges
+
+Medical Report Text:
+${extractedText}`
+            }]
+          }],
+          generationConfig: {
+            temperature: 0.3,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024
+          }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(`Gemini API error: ${JSON.stringify(errorData)}`);
     }
 
-    // Get or create conversation history for this session
-    if (!conversationHistories.has(sessionId)) {
-      conversationHistories.set(sessionId, []);
-    }
-    const history = conversationHistories.get(sessionId);
-
-    let reply = "I'm here to help with your health questions.";
-
-    try {
-      if (groqClient && GROQ_API_KEY && GROQ_API_KEY.startsWith("gsk_")) {
-        // Use Groq API for intelligent responses (only if key is valid)
-        const systemPrompt = `You are Vivitsu, an AI health assistant. You help patients understand their health conditions, 
-provide medical information, and offer general wellness advice. Always:
-- Be empathetic and supportive
-- Provide accurate medical information when possible
-- Remind users to consult healthcare professionals for serious concerns
-- Keep responses concise (2-3 sentences max)
-- If it's not health-related, politely redirect to health topics`;
-
-        // Build conversation messages for Groq
-        const messages = [
-          { role: "system", content: systemPrompt },
-          ...history.map(msg => ({
-            role: msg.role === "user" ? "user" : "assistant",
-            content: msg.text
-          })),
-          { role: "user", content: message }
-        ];
-
-        const response = await groqClient.chat.completions.create({
-          model: "llama-3.1-8b-instant",
-          messages: messages,
-          max_tokens: 200,
-          temperature: 0.7,
-        });
-
-        reply = response.choices[0]?.message?.content || "I couldn't process that. Please try again.";
-
-        // Store conversation
-        history.push({ role: "user", text: message });
-        history.push({ role: "model", text: reply });
-
-        // Limit history to last 10 exchanges (20 messages)
-        if (history.length > 20) {
-          history.splice(0, 2);
-        }
-
-      } else {
-        // Fallback to hardcoded responses if Groq not configured or API fails
-        if (message.toLowerCase().includes("bp") || message.toLowerCase().includes("blood pressure")) {
-          reply = "Normal blood pressure is around 120/80 mmHg. Readings vary based on age and health. Consult a doctor if concerned.";
-        }
-        else if (message.toLowerCase().includes("heart") || message.toLowerCase().includes("hr")) {
-          reply = "Normal heart rate is 60-100 bpm at rest. It increases with activity. If consistently high, see a doctor.";
-        }
-        else if (message.toLowerCase().includes("spo2") || message.toLowerCase().includes("oxygen")) {
-          reply = "Normal SpO2 is 95-100%. Below 90% requires medical attention. Contact a healthcare provider if concerning.";
-        }
-        else if (message.toLowerCase().includes("temperature") || message.toLowerCase().includes("fever")) {
-          reply = "Normal body temperature is 98.6°F (37°C). 100.4°F+ indicates fever. Stay hydrated and see a doctor if it persists.";
-        }
-        else if (message.toLowerCase().includes("glucose") || message.toLowerCase().includes("blood sugar")) {
-          reply = "Normal fasting glucose is 70-100 mg/dL. After meals, <140 mg/dL is normal. Diabetes screening available at clinics.";
-        }
-        else {
-          reply = "I can help with health questions. Ask me about vital signs, symptoms, or general wellness tips.";
-        }
-
-        // Store fallback conversation
-        history.push({ role: "user", text: message });
-        history.push({ role: "model", text: reply });
-      }
-
-    } catch (error) {
-      console.error("Groq API Error:", error);
-      // Fall back to hardcoded responses if Groq API fails
-      if (message.toLowerCase().includes("bp") || message.toLowerCase().includes("blood pressure")) {
-        reply = "Normal blood pressure is around 120/80 mmHg. Readings vary based on age and health. Consult a doctor if concerned.";
-      }
-      else if (message.toLowerCase().includes("heart") || message.toLowerCase().includes("hr")) {
-        reply = "Normal heart rate is 60-100 bpm at rest. It increases with activity. If consistently high, see a doctor.";
-      }
-      else if (message.toLowerCase().includes("spo2") || message.toLowerCase().includes("oxygen")) {
-        reply = "Normal SpO2 is 95-100%. Below 90% requires medical attention. Contact a healthcare provider if concerning.";
-      }
-      else if (message.toLowerCase().includes("temperature") || message.toLowerCase().includes("fever")) {
-        reply = "Normal body temperature is 98.6°F (37°C). 100.4°F+ indicates fever. Stay hydrated and see a doctor if it persists.";
-      }
-      else if (message.toLowerCase().includes("glucose") || message.toLowerCase().includes("blood sugar")) {
-        reply = "Normal fasting glucose is 70-100 mg/dL. After meals, <140 mg/dL is normal. Diabetes screening available at clinics.";
-      }
-      else {
-        reply = "I can help with health questions. Ask me about vital signs, symptoms, or general wellness tips.";
-      }
-
-      // Store fallback conversation
-      history.push({ role: "user", text: message });
-      history.push({ role: "model", text: reply });
-    }
-
-    res.json({ reply, sessionId });
-
+    const result = await response.json();
+    return result.candidates?.[0]?.content?.parts?.[0]?.text || "No analysis generated";
   } catch (error) {
-    console.error("Chat Error:", error);
-    res.status(500).json({ error: "Server error: " + error.message });
+    console.error('Gemini API Error:', error);
+    throw error;
+  }
+}
+
+// Chat with context endpoint
+app.post('/api/chat/message', async (req, res) => {
+  try {
+    const { messages, medicalReports } = req.body;
+
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'Messages array is required' });
+    }
+
+    const lastMessage = messages[messages.length - 1];
+    if (!lastMessage || !lastMessage.text) {
+      return res.status(400).json({ error: 'Last message must have text' });
+    }
+
+    // Build context from medical reports
+    let context = '';
+    if (medicalReports && medicalReports.length > 0) {
+      context = '\n\nMedical Context:\n' + medicalReports.map(report =>
+        `Report from ${report.uploadedAt}:\n${report.extractedText}\nAI Analysis: ${report.aiAnalysis}`
+      ).join('\n\n');
+    }
+
+    const prompt = `You are a helpful medical AI assistant. ${context ? 'Use the provided medical context to inform your response.' : ''}
+
+User: ${lastMessage.text}
+
+Provide a helpful, accurate response. If discussing medical topics, remind users to consult healthcare professionals.`;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: prompt }]
+          }],
+          generationConfig: {
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024
+          }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('Gemini API Chat Error:', errorData);
+      throw new Error(`Gemini API error (${response.status}): ${JSON.stringify(errorData)}`);
+    }
+
+    const result = await response.json();
+    const aiResponse = result.candidates?.[0]?.content?.parts?.[0]?.text || "I apologize, but I couldn't generate a response at this time.";
+
+    res.json({ success: true, response: aiResponse });
+  } catch (error) {
+    console.error('Chat Error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to process chat message', success: false });
   }
 });
 
-// MEDICAL ANALYSIS ROUTE
-app.post("/api/medical/analyze", async (req, res) => {
+// Analyze image endpoint (for eye analysis)
+app.post('/api/chat/analyze-image', async (req, res) => {
   try {
-    const { image } = req.body;
+    const { image, mimeType } = req.body;
 
-    if (!image) {
-      return res.status(400).json({ error: "No image provided" });
+    if (!image || !mimeType) {
+      return res.status(400).json({ error: 'Image and mimeType are required', success: false });
     }
 
-    // For now, just return dummy success to test connection
-    res.json({
+    // For eye analysis, use Gemini Vision directly
+    const prompt = `You are a medical AI assistant specializing in ophthalmology. Analyze this eye image and provide:
+
+1. **Visual Assessment**: Describe what you can observe in the image
+2. **Potential Findings**: Any visible abnormalities, conditions, or normal features
+3. **Recommendations**: Suggestions for the patient or when to see a doctor
+4. **Important Note**: This is AI analysis only - consult an eye care professional for proper diagnosis
+
+Please be thorough but remember this is not a substitute for professional medical advice.`;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data: image
+                }
+              }
+            ]
+          }],
+          generationConfig: {
+            temperature: 0.3,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 2048
+          }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('Gemini Vision API Error:', errorData);
+      throw new Error(`Gemini Vision API error (${response.status}): ${JSON.stringify(errorData)}`);
+    }
+
+    const result = await response.json();
+    const analysis = result.candidates?.[0]?.content?.parts?.[0]?.text || "Unable to analyze the image at this time.";
+
+    res.json({ success: true, response: analysis });
+  } catch (error) {
+    console.error('Image Analysis Error:', error);
+    res.status(500).json({ error: 'Failed to analyze image', success: false });
+  }
+});
+
+// Diet plan endpoint
+app.post('/api/chat/diet-plan', async (req, res) => {
+  try {
+    const { goal, medicalReports } = req.body;
+
+    let context = '';
+    if (medicalReports && medicalReports.length > 0) {
+      context = '\n\nMedical Context:\n' + medicalReports.map(report =>
+        `Report: ${report.extractedText}\nAnalysis: ${report.aiAnalysis}`
+      ).join('\n\n');
+    }
+
+    const prompt = `Create a personalized diet plan for: ${goal}
+
+${context}
+
+Provide:
+1. Daily meal suggestions
+2. Nutritional focus
+3. Foods to include/avoid
+4. Portion guidelines
+5. Important disclaimers
+
+⚠️ This is general advice. Consult a healthcare professional for medical conditions.`;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: prompt }]
+          }],
+          generationConfig: {
+            temperature: 0.4,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024
+          }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('Gemini Diet Plan API Error:', errorData);
+      throw new Error(`Gemini API error (${response.status}): ${JSON.stringify(errorData)}`);
+    }
+
+    const result = await response.json();
+    const dietPlan = result.candidates?.[0]?.content?.parts?.[0]?.text || "Unable to generate diet plan.";
+
+    res.json({ success: true, response: dietPlan });
+  } catch (error) {
+    console.error('Diet Plan Error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to generate diet plan', success: false });
+  }
+});
+
+// Health insights endpoint
+app.post('/api/chat/insights', async (req, res) => {
+  try {
+    const { medicalReports } = req.body;
+
+    if (!medicalReports || medicalReports.length === 0) {
+      return res.status(400).json({ error: 'Medical reports are required', success: false });
+    }
+
+    const context = medicalReports.map(report =>
+      `Report from ${report.uploadedAt}:\n${report.extractedText}\nAI Analysis: ${report.aiAnalysis}`
+    ).join('\n\n');
+
+    const prompt = `Analyze these medical reports and provide health insights:
+
+${context}
+
+Provide:
+1. Overall health trends
+2. Key patterns or concerns
+3. Recommendations for improvement
+4. When to consult healthcare providers
+
+⚠️ This is AI analysis only. Consult medical professionals for health decisions.`;
+
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{ text: prompt }]
+          }],
+          generationConfig: {
+            temperature: 0.3,
+            topK: 40,
+            topP: 0.95,
+            maxOutputTokens: 1024
+          }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('Gemini Insights API Error:', errorData);
+      throw new Error(`Gemini API error (${response.status}): ${JSON.stringify(errorData)}`);
+    }
+
+    const result = await response.json();
+    const insights = result.candidates?.[0]?.content?.parts?.[0]?.text || "Unable to generate insights.";
+
+    res.json({ success: true, response: insights });
+  } catch (error) {
+    console.error('Insights Error:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to generate insights', success: false });
+  }
+});
+
+// Medical reports endpoint
+app.get('/api/medical/reports', async (req, res) => {
+  try {
+    // For now, return empty array since we don't have a database for reports
+    // In a real app, you'd fetch from database
+    res.json({ reports: [] });
+  } catch (error) {
+    console.error('Reports Error:', error);
+    res.status(500).json({ error: 'Failed to fetch reports', success: false });
+  }
+});
+
+// Medical Analysis Endpoint
+app.post('/api/medical/analyze', async (req, res) => {
+  console.log('\n🔵 === NEW MEDICAL ANALYSIS REQUEST ===');
+
+  try {
+    const { image, mimeType } = req.body;
+
+    if (!image || !mimeType) {
+      console.error('❌ Missing image or mimeType');
+      return res.status(400).json({
+        error: "Missing required fields: image and mimeType",
+        success: false
+      });
+    }
+
+    console.log('📥 Request received:', {
+      mimeType,
+      imageSize: `${(image.length / 1024).toFixed(2)} KB`
+    });
+
+    const supportedTypes = ['image/png', 'image/jpeg', 'image/jpg', 'image/webp'];
+    if (!supportedTypes.includes(mimeType)) {
+      console.error('❌ Unsupported file type:', mimeType);
+      return res.status(400).json({
+        error: `Unsupported file type: ${mimeType}`,
+        success: false
+      });
+    }
+
+    console.log('🔍 Starting OCR extraction...');
+    const imageBuffer = Buffer.from(image, 'base64');
+
+    let extractedText;
+    try {
+      extractedText = await tesseract.recognize(imageBuffer, ocrConfig);
+      console.log('✅ OCR complete. Extracted', extractedText?.length || 0, 'characters');
+      console.log('📝 Preview:', extractedText?.substring(0, 100));
+    } catch (ocrError) {
+      console.error('❌ OCR Error:', ocrError.message);
+      return res.status(500).json({
+        error: "OCR extraction failed. Make sure Tesseract is installed.",
+        details: ocrError.message,
+        success: false
+      });
+    }
+
+    if (!extractedText || extractedText.trim().length < 20) {
+      console.error('❌ Insufficient text extracted');
+      return res.status(400).json({
+        error: "Could not extract sufficient text. Please use a clearer image.",
+        extractedText: extractedText || "",
+        success: false
+      });
+    }
+
+    console.log('🤖 Starting Gemini AI analysis...');
+    let analysis;
+    try {
+      analysis = await analyzeMedicalReport(extractedText);
+      console.log('✅ AI analysis complete!');
+    } catch (geminiError) {
+      console.error('❌ Gemini Error:', geminiError.message);
+      return res.status(500).json({
+        error: "AI analysis failed",
+        details: geminiError.message,
+        extractedText: extractedText.trim(),
+        success: false
+      });
+    }
+
+    console.log('✅ Sending successful response');
+
+    return res.status(200).json({
+      extractedText: extractedText.trim(),
+      analysis: analysis,
       success: true,
-      analysis: "Medical report analyzed successfully (test response)."
+      processedAt: new Date().toISOString()
     });
 
   } catch (error) {
-    console.error("Analyze Error:", error);
-    res.status(500).json({ error: "Server error" });
+    console.error("❌ Unexpected Error:", error);
+    return res.status(500).json({
+      error: "Server error during analysis",
+      details: error.message,
+      success: false
+    });
   }
 });
 
-// APPOINTMENT ROUTES
-app.use("/api/appointments", appointmentRoutes);
 
-// START SERVER
+// Health check
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Vivitsu Medical AI Backend',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      medicalAnalysis: 'POST /api/medical/analyze',
+      chatMessage: 'POST /api/chat/message',
+      analyzeImage: 'POST /api/chat/analyze-image',
+      dietPlan: 'POST /api/chat/diet-plan',
+      healthInsights: 'POST /api/chat/insights',
+      medicalReports: 'GET /api/medical/reports'
+    }
+  });
+});
+
+// Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📝 API Base URL: http://localhost:${PORT}/api`);
-  console.log(`✅ Environment: ES Modules (type: "module")`);
-  console.log(`📅 Appointments: http://localhost:${PORT}/api/appointments`);
+  console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🔑 Gemini API: ${GEMINI_API_KEY ? '✅ Configured' : '❌ Missing'}`);
+  console.log(`🏥 Medical Analysis: http://localhost:${PORT}/api/medical/analyze\n`);
 });
