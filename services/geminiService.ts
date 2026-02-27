@@ -1,201 +1,169 @@
-// backend/services/geminiService.ts
-// Gemini API integration with structured prompts
-
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import { config, MEDICAL_DISCLAIMERS } from '../config/env';
-import { logger } from '../utils/logger';
-
-const genAI = new GoogleGenerativeAI(config.GEMINI_API_KEY);
-
-interface MessageContext {
+interface ChatMessage {
   role: 'user' | 'model';
-  parts: Array<{ text: string }>;
+  text: string;
 }
 
-export class GeminiService {
-  private model = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
-  private conversationHistory: MessageContext[] = [];
-  private tokenCount = 0;
+interface MedicalReport {
+  _id: string;
+  extractedText: string;
+  aiAnalysis: string;
+  uploadedAt: string;
+}
 
-  /**
-   * Analyze medical report with structured prompt
-   */
-  async analyzeReport(extractedText: string): Promise<string> {
+// Use environment variable or default to localhost:5000
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+
+console.log('🔌 API Base URL:', API_BASE_URL);
+
+export const geminiService = {
+  // Fetch user's medical reports from backend
+  async fetchMedicalReports(): Promise<MedicalReport[]> {
     try {
-      const prompt = `You are a medical assistant. Analyze this medical report and provide:
+      console.log('📥 Fetching medical reports from:', `${API_BASE_URL}/medical/reports`);
+      const response = await fetch(`${API_BASE_URL}/medical/reports`);
 
-1. **Summary**: Brief overview (2-3 sentences)
-2. **Key Findings**: Important observations and diagnoses
-3. **Lab Values**: Extract all numerical values with units and normal ranges
-4. **Patient Information**: Name, age, date if available
-5. **Recommendations**: Prescribed medications, follow-ups
-6. **Abnormalities**: Flag any values outside normal ranges
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
 
-Report Text:
-${extractedText}
-
-${MEDICAL_DISCLAIMERS.report}`;
-
-      const result = await this.model.generateContent(prompt);
-      const response = result.response.text();
-
-      this.tokenCount += result.response.usageMetadata?.promptTokens || 0;
-      this.tokenCount += result.response.usageMetadata?.candidatesTokens || 0;
-
-      return response;
+      const data = await response.json();
+      console.log('✅ Reports fetched:', data.reports?.length || 0);
+      return data.reports || [];
     } catch (error) {
-      logger.error('Gemini report analysis failed', error as Error);
-      throw new Error('Failed to analyze medical report');
+      console.error('❌ Error fetching reports:', error);
+      return [];
     }
-  }
+  },
 
-  /**
-   * Chat with medical context
-   */
-  async chat(userMessage: string, medicalContext?: string): Promise<string> {
+  // Simple chat with AI via backend
+  async chatWithContext(
+    messages: ChatMessage[],
+    medicalReports: MedicalReport[] = [],
+    sessionId: string = 'default'
+  ): Promise<string> {
     try {
-      let systemPrompt = `You are Vivitsu, a professional medical AI assistant.
-You provide accurate, helpful health information while maintaining medical ethics.
+      // Get the last user message
+      const lastMessage = messages[messages.length - 1]?.text || '';
 
-RULES:
-- Always include relevant medical disclaimers
-- Remind user to consult healthcare professionals
-- Be empathetic and clear
-- If uncertain, acknowledge limitations
-- Flag any emergency symptoms`;
-
-      if (medicalContext) {
-        systemPrompt += `\n\nPATIENT MEDICAL CONTEXT:\n${medicalContext}`;
+      if (!lastMessage) {
+        throw new Error('No message to send');
       }
 
-      this.conversationHistory.push({
-        role: 'user',
-        parts: [{ text: userMessage }],
-      });
+      console.log('📤 POST /api/chat ->', `${API_BASE_URL}/chat`);
 
-      // Trim history if too long
-      if (this.conversationHistory.length > config.MAX_CHAT_HISTORY_MESSAGES) {
-        this.conversationHistory = this.conversationHistory.slice(
-          -config.MAX_CHAT_HISTORY_MESSAGES
-        );
-      }
-
-      const result = await this.model.generateContent({
-        contents: this.conversationHistory,
-        systemInstruction: systemPrompt,
-        generationConfig: {
-          maxOutputTokens: config.GEMINI_MAX_TOKENS,
-          temperature: 0.7,
+      const response = await fetch(`${API_BASE_URL}/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
+        body: JSON.stringify({
+          message: lastMessage,
+          sessionId
+        })
       });
 
-      const response = result.response.text();
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(`HTTP ${response.status}: ${errorData.error || response.statusText}`);
+      }
 
-      this.conversationHistory.push({
-        role: 'model',
-        parts: [{ text: response }],
+      const data = await response.json();
+
+      if (!data.reply) {
+        throw new Error('No response from AI');
+      }
+
+      console.log('✅ Chat response received:', data.reply.substring(0, 50) + '...');
+      return data.reply;
+    } catch (error: any) {
+      console.error('❌ Chat Error:', error);
+      throw new Error(error.message || 'Failed to get AI response');
+    }
+  },
+
+  // Generate personalized diet plan (calls backend)
+  async generateDietPlan(
+    goal: string,
+    medicalReports: MedicalReport[] = [],
+    sessionId: string = 'diet-plan'
+  ): Promise<string> {
+    try {
+      const message = `Generate a personalized diet plan for the following goal: ${goal}. 
+Keep it practical and health-focused.`;
+
+      const response = await fetch(`${API_BASE_URL}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message,
+          sessionId
+        })
       });
 
-      this.tokenCount += result.response.usageMetadata?.promptTokens || 0;
-      this.tokenCount += result.response.usageMetadata?.candidatesTokens || 0;
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      return response;
-    } catch (error) {
-      logger.error('Gemini chat failed', error as Error);
-      throw new Error('Failed to process chat message');
+      const data = await response.json();
+      return data.reply || 'Diet plan generation failed';
+    } catch (error: any) {
+      console.error('Diet Plan Error:', error);
+      throw new Error(error.message || 'Failed to generate diet plan');
     }
-  }
+  },
 
-  /**
-   * Generate health risk assessment
-   */
-  async assessRisk(medicalData: string): Promise<{
-    riskScore: number;
-    riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
-    recommendations: string;
-    emergencyFlags: string[];
-  }> {
+  // Get health insights (calls backend)
+  async getHealthInsights(medicalReports: MedicalReport[], sessionId: string = 'health-insights'): Promise<string> {
     try {
-      const prompt = `Analyze the following medical data and provide a risk assessment (NOT a diagnosis).
+      const message = `Based on my medical reports, what health insights and recommendations can you provide?`;
 
-Data: ${medicalData}
+      const response = await fetch(`${API_BASE_URL}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message,
+          sessionId
+        })
+      });
 
-Respond with JSON format:
-{
-  "riskScore": <0-100>,
-  "riskLevel": "<LOW|MEDIUM|HIGH|CRITICAL>",
-  "abnormalMetrics": ["list of abnormal metrics"],
-  "recommendations": "Brief recommendations",
-  "emergencyFlags": ["any emergency indicators"]
-}
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-${MEDICAL_DISCLAIMERS.risk}`;
-
-      const result = await this.model.generateContent(prompt);
-      const response = result.response.text();
-
-      // Parse JSON response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('Invalid response format');
-      }
-
-      const assessment = JSON.parse(jsonMatch[0]);
-
-      this.tokenCount += result.response.usageMetadata?.promptTokens || 0;
-
-      return assessment;
-    } catch (error) {
-      logger.error('Risk assessment failed', error as Error);
-      throw new Error('Failed to generate risk assessment');
+      const data = await response.json();
+      return data.reply || 'Failed to generate insights';
+    } catch (error: any) {
+      console.error('Insights Error:', error);
+      throw new Error(error.message || 'Failed to generate insights');
     }
-  }
+  },
 
-  /**
-   * Extract structured data from text
-   */
-  async extractMetadata(text: string): Promise<Record<string, any>> {
+  // Legacy symptom analysis (uses chatWithContext)
+  async analyzeSymptoms(messages: ChatMessage[]): Promise<string> {
     try {
-      const prompt = `Extract and structure medical data from this text. Return JSON with:
-{
-  "conditions": ["list of identified conditions"],
-  "medications": ["prescribed medications"],
-  "symptoms": ["reported symptoms"],
-  "procedures": ["procedures mentioned"],
-  "recommendations": ["recommendations"]
-}
+      const lastMessage = messages[messages.length - 1]?.text || '';
+      return this.chatWithContext(messages);
+    } catch (error: any) {
+      console.error('Symptom Analysis Error:', error);
+      throw error;
+    }
+  },
 
-Text: ${text}`;
+  // Analyze medical report image
+  async analyzeReport(base64Image: string, mimeType: string): Promise<string> {
+    try {
+      const message = `Please analyze this medical report image and provide key findings.`;
 
-      const result = await this.model.generateContent(prompt);
-      const response = result.response.text();
+      // Call backend endpoint that uses Gemini Vision
+      const response = await fetch(`${API_BASE_URL}/medical/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: base64Image, mimeType, message })
+      });
 
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        return {};
-      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      return JSON.parse(jsonMatch[0]);
-    } catch (error) {
-      logger.error('Metadata extraction failed', error as Error);
-      return {};
+      const data = await response.json();
+      return data.reply || data.analysis || 'Image analysis failed';
+    } catch (error: any) {
+      console.error('Image Analysis Error:', error);
+      return "Image analysis temporarily unavailable. Please try again later.";
     }
   }
-
-  /**
-   * Get token usage
-   */
-  getTokenUsage(): number {
-    return this.tokenCount;
-  }
-
-  /**
-   * Clear conversation history
-   */
-  clearHistory(): void {
-    this.conversationHistory = [];
-    this.tokenCount = 0;
-  }
-}
-
-export const geminiService = new GeminiService();
+};
